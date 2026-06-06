@@ -24,6 +24,27 @@ class RetrievalInjectConfig:
 
 
 @dataclass(frozen=True)
+class GateConfig:
+    enabled: bool = False
+    timeout_ms: int = 800
+    max_tokens: int = 220
+
+
+@dataclass(frozen=True)
+class HyDEConfig:
+    enabled: bool = False
+    timeout_s: float = 2.0
+    max_tokens: int = 80
+
+
+@dataclass(frozen=True)
+class SufficiencyConfig:
+    enabled: bool = False
+    timeout_ms: int = 600
+    max_tokens: int = 120
+
+
+@dataclass(frozen=True)
 class RetrievalConfig:
     top_k_history: int = 8
     score_threshold: float = 0.45
@@ -39,7 +60,9 @@ class RetrievalConfig:
 class DefaultMemoryConfig:
     db_path: str = ""
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
-
+    gate: GateConfig = field(default_factory=GateConfig)
+    hyde: HyDEConfig = field(default_factory=HyDEConfig)
+    sufficiency: SufficiencyConfig = field(default_factory=SufficiencyConfig)
 
 def load_default_memory_config(
     *,
@@ -101,6 +124,9 @@ def _build_config(payload: dict[str, Any]) -> DefaultMemoryConfig:
     retrieval = _as_dict(payload.get("retrieval"))
     thresholds = _as_dict(retrieval.get("thresholds"))
     inject = _as_dict(retrieval.get("inject"))
+    gate = _as_dict(payload.get("gate"))
+    hyde = _as_dict(payload.get("hyde"))
+    sufficiency = _as_dict(payload.get("sufficiency"))
     return DefaultMemoryConfig(
         db_path=str(payload.get("db_path", "")),
         retrieval=RetrievalConfig(
@@ -123,6 +149,21 @@ def _build_config(payload: dict[str, Any]) -> DefaultMemoryConfig:
                 event_profile=int(inject.get("event_profile", 4)),
                 line_max=int(inject.get("line_max", 600)),
             ),
+        ),
+        gate=GateConfig(
+            enabled=bool(gate.get("enabled", False)),
+            timeout_ms=int(gate.get("timeout_ms", 800)),
+            max_tokens=int(gate.get("max_tokens", 220)),
+        ),
+        hyde=HyDEConfig(
+            enabled=bool(hyde.get("enabled", False)),
+            timeout_s=float(hyde.get("timeout_s", 2.0)),
+            max_tokens=int(hyde.get("max_tokens", 80)),
+        ),
+        sufficiency=SufficiencyConfig(
+            enabled=bool(sufficiency.get("enabled", False)),
+            timeout_ms=int(sufficiency.get("timeout_ms", 600)),
+            max_tokens=int(sufficiency.get("max_tokens", 120)),
         ),
     )
 

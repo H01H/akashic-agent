@@ -18,3 +18,17 @@ forced = 3
 procedure_preference = 4
 event_profile = 4
 line_max = 600
+[gate]
+enabled = true
+timeout_ms = 2000
+max_tokens = 220
+
+[hyde]
+enabled = true
+timeout_s = 2.0
+max_tokens = 80
+
+[sufficiency]
+enabled = true
+timeout_ms = 600
+max_tokens = 120

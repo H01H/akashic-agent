@@ -46,6 +46,10 @@ from memory2.retriever import Retriever
 from memory2.rule_schema import build_procedure_rule_schema
 from memory2.store import MemoryStore2
 from plugins.default_memory.config import DefaultMemoryConfig, resolve_memory_db_path
+from memory2.query_rewriter import QueryRewriter, GateDecision
+from memory2.hyde_enhancer import HyDEEnhancer, HyDEAugmentResult
+from memory2.sufficiency_checker import SufficiencyChecker, SufficiencyResult, should_check_sufficiency
+
 
 if TYPE_CHECKING:
     from bus.event_bus import EventBus
@@ -620,6 +624,38 @@ class DefaultMemoryEngine:
             light_model=self._light_model,
             event_publisher=event_publisher,
         )
+        gate_cfg = default_config.gate
+        self._query_rewriter = (
+            QueryRewriter(
+                llm_client=self._light_provider,
+                model=self._light_model,
+                max_tokens=gate_cfg.max_tokens,
+                timeout_ms=gate_cfg.timeout_ms,
+            )
+            if gate_cfg.enabled and hasattr(self._light_provider, "chat")
+            else None
+        )
+        hyde_cfg = default_config.hyde
+        self._hyde_enhancer = (
+            HyDEEnhancer(
+                light_provider=self._light_provider,
+                light_model=self._light_model,
+                timeout_s=hyde_cfg.timeout_s,
+            )
+            if hyde_cfg.enabled and hasattr(self._light_provider, "chat")
+            else None
+        )
+        suff_cfg = default_config.sufficiency
+        self._sufficiency_checker = (
+            SufficiencyChecker(
+                llm_client=self._light_provider,
+                model=self._light_model,
+                max_tokens=suff_cfg.max_tokens,
+                timeout_ms=suff_cfg.timeout_ms,
+            )
+            if suff_cfg.enabled and hasattr(self._light_provider, "chat")
+            else None
+        )
         self._wire_memory2_events()
         self.closeables = [self._v2_store, self._embedder]
 
@@ -752,13 +788,39 @@ class DefaultMemoryEngine:
         retriever = self._retriever
         if retriever is None:
             return MemoryQueryResult(raw={"items": []})
+        effective_query = request.text
+        gate_trace: dict[str, object] = {}
+        if self._query_rewriter:
+            recent_history = self._build_recent_context(request)
+            try:
+                decision = await self._query_rewriter.decide(
+                    user_msg=request.text,
+                    recent_history=recent_history,
+                )
+                gate_trace = {
+                    "gate_needs_episodic": decision.needs_episodic,
+                    "gate_rewritten_query": decision.episodic_query,
+                    "gate_procedure_query": decision.procedure_query,
+                    "gate_latency_ms": decision.latency_ms,
+                }
+                if not decision.needs_episodic:
+                    logger.warning("query_gate skipped: %r", request.text[:60])
+                    return MemoryQueryResult(
+                        text_block="",
+                        records=[],
+                        trace={**gate_trace, "gate_action": "skipped"},
+                        raw={"gate_decision": "skip"},
+                    )
+                effective_query = decision.episodic_query
+            except Exception as exc:
+                logger.warning("query_gate error, fallback to full retr: %s", exc)
         scope = resolve_memory_scope(request.scope)
         queries = self._resolve_queries(request)
         memory_types = self._resolve_memory_types(request)
         items = await self._retrieve_related(
-            request.text,
-            memory_types=memory_types,
+            effective_query,
             top_k=request.limit,
+            memory_types=memory_types,
             scope_channel=scope.channel or None,
             scope_chat_id=scope.chat_id or None,
             require_scope_match=bool(request.filters.hints.get("require_scope_match", False)),
@@ -766,6 +828,76 @@ class DefaultMemoryEngine:
             time_start=request.filters.time_start,
             time_end=request.filters.time_end,
         )
+
+        # --- HyDE 增强（仅 intent=answer 且有检索结果时） ---
+        hyde_trace: dict[str, object] = {}
+        if (
+            self._hyde_enhancer
+            and items
+            and request.intent == "answer"
+        ):
+            try:
+                hyde_context = self._build_recent_context(request)
+                result = await self._hyde_enhancer.augment(
+                    raw_query=effective_query,
+                    context=hyde_context,
+                    retrieve_fn=self._retriever.retrieve,
+                    top_k=request.limit,
+                    memory_types=memory_types,
+                    scope_channel=scope.channel or None,
+                    scope_chat_id=scope.chat_id or None,
+                    require_scope_match=bool(request.filters.hints.get("require_scope_match", False)),
+                    aux_queries=queries[1:],
+                    time_start=request.filters.time_start,
+                    time_end=request.filters.time_end,
+                )
+                items = result.items
+                hyde_trace = {
+                    "used_hyde": result.used_hyde,
+                    "hypothesis": (
+                        result.hypothesis[:200] if result.hypothesis else None
+                    ),
+                }
+            except Exception as exc:
+                logger.warning("hyde augment failed, using raw: %s", exc)
+                hyde_trace = {"used_hyde": False, "error": str(exc)[:80]}
+
+        # --- Sufficiency 检查（仅检索结果为空时） ---
+        suff_trace: dict[str, object] = {}
+        if self._sufficiency_checker and should_check_sufficiency(items):
+            try:
+                suff_result = await self._sufficiency_checker.check(
+                    query=effective_query,
+                    items=items,
+                    context=self._build_recent_context(request),
+                )
+                suff_trace = {
+                    "suff_is_sufficient": suff_result.is_sufficient,
+                    "suff_refined_query": suff_result.refined_query,
+                    "suff_latency_ms": suff_result.latency_ms,
+                }
+                # 不足且 LLM 给了 refined_query → 再查一次
+                if not suff_result.is_sufficient and suff_result.refined_query:
+                    logger.warning(
+                        "sufficiency insufficient, re-retrieving with: %r",
+                        suff_result.refined_query[:60],
+                    )
+                    items = await self._retrieve_related(
+                        suff_result.refined_query,
+                        top_k=request.limit,
+                        memory_types=memory_types,
+                        scope_channel=scope.channel or None,
+                        scope_chat_id=scope.chat_id or None,
+                        require_scope_match=bool(request.filters.hints.get("require_scope_match", False)),
+                        aux_queries=queries[1:],
+                        time_start=request.filters.time_start,
+                        time_end=request.filters.time_end,
+                    )
+                    suff_trace["re_retrieved"] = True
+            except Exception as exc:
+                logger.warning("sufficiency check failed: %s", exc)
+                suff_trace = {"suff_error": str(exc)[:80]}
+
         text_block, injected_ids = retriever.build_injection_block(items)
         records = [
             self._build_record(item, injected_ids=injected_ids)
@@ -778,9 +910,29 @@ class DefaultMemoryEngine:
                 "engine": self.DESCRIPTOR.name,
                 "profile": self.DESCRIPTOR.profile.value,
                 "intent": request.intent,
+                **gate_trace,
+                **hyde_trace,
+                **suff_trace,
             },
             raw={"items": items},
         )
+    @staticmethod
+    def _build_recent_context(request: MemoryQuery) -> str:
+        """从 request.context['history'] 取最近 4 轮对话格式化。"""
+        raw = (request.context or {}).get("history")
+        if not raw or not isinstance(raw, list):
+            return ""
+        recent = raw[-8:]  # 最近 8 条消息 ≈ 4 轮（一问一答）
+        lines: list[str] = []
+        for msg in recent:
+            role = getattr(msg, "role", "") or ""
+            content = getattr(msg, "content", "") or ""
+            if isinstance(content, list):
+                content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            text = str(content).strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        return "\n".join(lines)
 
     # post-response 摄入入口：外部只提交对话内容，失效判断仍在 engine 内部完成。
     async def ingest(self, request: MemoryIngestRequest) -> MemoryIngestResult:
