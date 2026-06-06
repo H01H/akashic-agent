@@ -1284,10 +1284,39 @@ class DefaultMemoryEngine:
         self,
         request: MemoryQuery,
     ) -> MemoryQueryResult:
-        hyp1_task = asyncio.create_task(self._gen_hypothesis(request.text, style="event"))
-        hyp2_task = asyncio.create_task(self._gen_hypothesis(request.text, style="general"))
-        hyp1, hyp2 = await asyncio.gather(hyp1_task, hyp2_task)
-        aux_queries = [text for text in (hyp1, hyp2) if text]
+        if self._hyde_enhancer:
+            scope = resolve_memory_scope(request.scope)
+            types = self._resolve_memory_types(request)
+            retrieve_kwargs = dict(
+                memory_types=types,
+                scope_channel=scope.channel or None,
+                scope_chat_id=scope.chat_id or None,
+                require_scope_match=should_require_scope_match(request, scope),
+                score_threshold=_VECTOR_SCORE_THRESHOLD,
+                time_start=request.filters.time_start,
+                time_end=request.filters.time_end,
+                keyword_enabled=True,
+            )
+            hr = await self._hyde_enhancer.augment(
+                raw_query=request.text,
+                context=self._build_recent_context(request),
+                retrieve_fn=self._retrieve_related,
+                top_k=max(request.limit, _VECTOR_TOP_K),
+                **retrieve_kwargs,
+            )
+            sliced = list(hr.items)[: request.limit]
+            return MemoryQueryResult(
+                records=[self._build_record(item) for item in sliced if isinstance(item, dict)],
+                trace={
+                    "source": self.DESCRIPTOR.name,
+                    "intent": request.intent,
+                    "hit_count": len(sliced),
+                    "used_hyde": hr.used_hyde,
+                    "hypothesis": hr.hypothesis[:200] if hr.hypothesis else None,
+                },
+                raw={"items": sliced},
+            )
+        # fallback: 无 HyDE 模块时的纯检索
         scope = resolve_memory_scope(request.scope)
         types = self._resolve_memory_types(request)
         hits = await self._retrieve_related(
@@ -1297,7 +1326,6 @@ class DefaultMemoryEngine:
             scope_channel=scope.channel or None,
             scope_chat_id=scope.chat_id or None,
             require_scope_match=should_require_scope_match(request, scope),
-            aux_queries=aux_queries,
             score_threshold=_VECTOR_SCORE_THRESHOLD,
             time_start=request.filters.time_start,
             time_end=request.filters.time_end,
@@ -1310,7 +1338,6 @@ class DefaultMemoryEngine:
                 "source": self.DESCRIPTOR.name,
                 "intent": request.intent,
                 "hit_count": len(sliced),
-                "hyde_hypotheses": aux_queries,
             },
             raw={"items": sliced},
         )
