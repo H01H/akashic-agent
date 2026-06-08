@@ -20,22 +20,25 @@ def get_today() -> dict:
     }
 
 
-def get_week(year: int, month: int, day: int) -> list[dict]:
-    """返回包含指定日期的整个周。"""
-    d = date(year, month, day)
-    monday = d - timedelta(days=d.weekday())
+
+
+def get_week(year: int, month: int, day: int) -> str:
+    target_date = date(year, month, day)
+    monday = target_date - timedelta(days=target_date.weekday())
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
     result = []
     for i in range(7):
-        day = monday + timedelta(days=i)
+        current_date = monday + timedelta(days=i)
         result.append({
-            "date": day.isoformat(),
+            "date": current_date.isoformat(),
             "weekday": weekdays[i],
-            "year": day.year,
-            "month": day.month,
-            "day": day.day,
+            "year": current_date.year,
+            "month": current_date.month,
+            "day": current_date.day,
         })
-    return result
+
+    return json.dumps(result, ensure_ascii=False)
 
 
 def days_until(year: int, month: int, day: int) -> dict:
